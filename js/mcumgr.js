@@ -1,37 +1,39 @@
 
 // Opcodes
-const MGMT_OP_READ = 0;
-const MGMT_OP_READ_RSP = 1;
-const MGMT_OP_WRITE = 2;
-const MGMT_OP_WRITE_RSP = 3;
+export const MGMT_OP_READ = 0;
+export const MGMT_OP_READ_RSP = 1;
+export const MGMT_OP_WRITE = 2;
+export const MGMT_OP_WRITE_RSP = 3;
 
 // Groups
-const MGMT_GROUP_ID_OS = 0;
-const MGMT_GROUP_ID_IMAGE = 1;
-const MGMT_GROUP_ID_STAT = 2;
-const MGMT_GROUP_ID_CONFIG = 3;
-const MGMT_GROUP_ID_LOG = 4;
-const MGMT_GROUP_ID_CRASH = 5;
-const MGMT_GROUP_ID_SPLIT = 6;
-const MGMT_GROUP_ID_RUN = 7;
-const MGMT_GROUP_ID_FS = 8;
-const MGMT_GROUP_ID_SHELL = 9;
+export const MGMT_GROUP_ID_OS = 0;
+export const MGMT_GROUP_ID_IMAGE = 1;
+export const MGMT_GROUP_ID_STAT = 2;
+export const MGMT_GROUP_ID_CONFIG = 3;
+export const MGMT_GROUP_ID_LOG = 4;
+export const MGMT_GROUP_ID_CRASH = 5;
+export const MGMT_GROUP_ID_SPLIT = 6;
+export const MGMT_GROUP_ID_RUN = 7;
+export const MGMT_GROUP_ID_FS = 8;
+export const MGMT_GROUP_ID_SHELL = 9;
 
 // OS group
-const OS_MGMT_ID_ECHO = 0;
-const OS_MGMT_ID_CONS_ECHO_CTRL = 1;
-const OS_MGMT_ID_TASKSTAT = 2;
-const OS_MGMT_ID_MPSTAT = 3;
-const OS_MGMT_ID_DATETIME_STR = 4;
-const OS_MGMT_ID_RESET = 5;
+export const OS_MGMT_ID_ECHO = 0;
+export const OS_MGMT_ID_CONS_ECHO_CTRL = 1;
+export const OS_MGMT_ID_TASKSTAT = 2;
+export const OS_MGMT_ID_MPSTAT = 3;
+export const OS_MGMT_ID_DATETIME_STR = 4;
+export const OS_MGMT_ID_RESET = 5;
 
 // Image group
-const IMG_MGMT_ID_STATE = 0;
-const IMG_MGMT_ID_UPLOAD = 1;
-const IMG_MGMT_ID_FILE = 2;
-const IMG_MGMT_ID_CORELIST = 3;
-const IMG_MGMT_ID_CORELOAD = 4;
-const IMG_MGMT_ID_ERASE = 5;
+export const IMG_MGMT_ID_STATE = 0;
+export const IMG_MGMT_ID_UPLOAD = 1;
+export const IMG_MGMT_ID_FILE = 2;
+export const IMG_MGMT_ID_CORELIST = 3;
+export const IMG_MGMT_ID_CORELOAD = 4;
+export const IMG_MGMT_ID_ERASE = 5;
+
+import CBOR from './cbor';
 
 class MCUManager {
     constructor(di = {}) {
@@ -54,9 +56,10 @@ class MCUManager {
         this._userRequestedDisconnect = false;
     }
     async _requestDevice(filters) {
+        console.log(filters);
         const params = {
             acceptAllDevices: true,
-            optionalServices: [this.SERVICE_UUID]
+            optionalServices: [0x180F, this.SERVICE_UUID]
         };
         if (filters) {
             params.filters = filters;
@@ -93,9 +96,13 @@ class MCUManager {
                 this._service = await server.getPrimaryService(this.SERVICE_UUID);
                 this._logger.info(`Service connected.`);
                 this._characteristic = await this._service.getCharacteristic(this.CHARACTERISTIC_UUID);
+                this._logger.info(`Characteristic connected.`);
                 this._characteristic.addEventListener('characteristicvaluechanged', this._notification.bind(this));
+                this._logger.info(`Notifications enabled.`);
                 await this._characteristic.startNotifications();
+                this._logger.info(`Notifications started.`);
                 await this._connected();
+                this._logger.info(`Connected.`);
                 if (this._uploadIsInProgress) {
                     this._uploadNext();
                 }
@@ -154,6 +161,9 @@ class MCUManager {
         if (typeof data !== 'undefined') {
             encodedData = [...new Uint8Array(CBOR.encode(data))];
         }
+        if (this._characteristic == null) {
+            return;
+        }
         const length_lo = encodedData.length & 255;
         const length_hi = encodedData.length >> 8;
         const group_lo = group & 255;
@@ -175,6 +185,7 @@ class MCUManager {
         this._buffer = this._buffer.slice(messageLength + 8);
     }
     _processMessage(message) {
+        //console.log('message received', message);
         const [op, _flags, length_hi, length_lo, group_hi, group_lo, _seq, id] = message;
         const data = CBOR.decode(message.slice(8).buffer);
         const length = length_hi * 256 + length_lo;
@@ -184,8 +195,10 @@ class MCUManager {
             if (this._uploadTimeout) {
                 clearTimeout(this._uploadTimeout);
             }
-            this._uploadOffset = data.off;            
-            this._uploadNext();
+            this._uploadOffset = data.off;
+            if (this._uploadIsInProgress) {    
+                this._uploadNext();
+            }
             return;
         }
         if (this._messageCallback) this._messageCallback({ op, group, id, data, length });
@@ -199,8 +212,8 @@ class MCUManager {
     cmdImageState() {
         return this._sendMessage(MGMT_OP_READ, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_STATE);
     }
-    cmdImageErase() {
-        return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_ERASE, {});
+    cmdImageErase(slot = 1) {
+        return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_ERASE);
     }
     cmdImageTest(hash) {
         return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_STATE, { hash, confirm: false });
@@ -212,7 +225,7 @@ class MCUManager {
         return crypto.subtle.digest('SHA-256', image);
     }
     async _uploadNext() {
-        if (this._uploadOffset >= this._uploadImage.byteLength) {
+        if (this._uploadOffset >= this._uploadImage.byteLength || !this._uploadIsInProgress) {
             this._uploadIsInProgress = false;
             this._imageUploadFinishedCallback();
             return;
@@ -229,7 +242,7 @@ class MCUManager {
         }, this._chunkTimeout);
 
         const nmpOverhead = 8;
-        const message = { data: new Uint8Array(), off: this._uploadOffset };
+        const message = { data: new Uint8Array(), off: this._uploadOffset, image: this._uploadImageNumber };
         if (this._uploadOffset === 0) {
             message.len = this._uploadImage.byteLength;
             message.sha = new Uint8Array(await this._hash(this._uploadImage));
@@ -242,18 +255,27 @@ class MCUManager {
 
         // Keep offset for retry
         // this._uploadOffset += length;
-
-        this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_UPLOAD, message);
+        try {
+            await this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_UPLOAD, message);
+        } catch (error) {
+            this._logger.error('Error sending upload message:', error);
+            clearTimeout(this._uploadTimeout);
+            return;
+        }
+            
     }
-    async cmdUpload(image, slot = 0) {
+    async cmdUpload(image, imageNumber = 0, slot = 0) {
         if (this._uploadIsInProgress) {
             this._logger.error('Upload is already in progress.');
             return;
         }
+        this._logger.info(`Starting upload of image ${imageNumber}...`);
         this._uploadIsInProgress = true;
-
+        this._logger.info(`Image size: ${image.byteLength} bytes`);
+        this._logger.info(`MTU size: ${this._mtu} bytes`);
         this._uploadOffset = 0;
         this._uploadImage = image;
+        this._uploadImageNumber = imageNumber;
         this._uploadSlot = slot;
 
         this._uploadNext();
@@ -308,3 +330,4 @@ class MCUManager {
     }
 }
 
+export default MCUManager;
