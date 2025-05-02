@@ -50,14 +50,18 @@ class MCUManager {
         this._connectCallback = null;
         this._connectingCallback = null;
         this._disconnectCallback = null;
+        this._netbuf_size = 90;
         this._messageCallback = null;
         this._imageUploadProgressCallback = null;
         this._uploadIsInProgress = false;
-        this._chunkTimeout = 500; // 500ms, if sending a chunk is not completed in this time, it will be retried (even 250ms can be too low for some devices)
+        this._chunkTimeout = 5000; // 500ms, if sending a chunk is not completed in this time, it will be retried (even 250ms can be too low for some devices)
         this._buffer = new Uint8Array();
         this._logger = di.logger || { info: console.log, error: console.error };
         this._seq = 0;
         this._userRequestedDisconnect = false;
+        this._port = null; // Serial port instance
+        this._reader = null; // Reader for incoming data
+        this._writer = null; // Writer for outgoing data
     }
 
     async _requestDevice(filters) {
@@ -93,6 +97,267 @@ class MCUManager {
             return;
         }
     }
+
+    async connectSerial() {
+        try {
+            // Request a port and open a connection
+            this._port = await navigator.serial.requestPort();
+            await this._port.open({ baudRate: 115200 }); // Set baud rate (adjust as needed)
+
+            // Set up the reader and writer
+            this._reader = this._port.readable.getReader();
+            this._writer = this._port.writable.getWriter();
+
+            this._logger.info('Serial device connected.');
+
+            // Start listening for incoming data
+            this._listenForSerialData();
+
+            // Trigger the connected callback
+            if (this._connectCallback) this._connectCallback();
+        } catch (error) {
+            this._logger.error('Failed to connect to serial device:', error);
+        }
+    }
+
+    async disconnectSerial() {
+        try {
+            if (this._reader) {
+                await this._reader.cancel();
+                this._reader.releaseLock();
+                this._reader = null;
+            }
+            if (this._writer) {
+                this._writer.releaseLock();
+                this._writer = null;
+            }
+            if (this._port) {
+                await this._port.close();
+                this._port = null;
+            }
+            this._logger.info('Serial device disconnected.');
+        } catch (error) {
+            this._logger.error('Failed to disconnect serial device:', error);
+        }
+    }
+
+    // Base64 encoding and decoding
+    base64Encode(data) {
+        return btoa(String.fromCharCode(...data));
+    }
+
+    base64Decode(data) {
+        return new Uint8Array(atob(data).split('').map(char => char.charCodeAt(0)));
+    }
+
+    // CRC16 calculation (polynomial 0x1021, initial value 0)
+    calculateCRC16(data) {
+        let crc = 0x0000;
+        for (let byte of data) {
+            crc ^= (byte << 8);
+            for (let i = 0; i < 8; i++) {
+                if (crc & 0x8000) {
+                    crc = (crc << 1) ^ 0x1021;
+                } else {
+                    crc <<= 1;
+                }
+            }
+            crc &= 0xFFFF;
+        }
+        return crc;
+    }
+
+    wrapSMPForSerial(payload, mtu = 127) {
+        const MTU_BODY_SIZE = Math.floor((mtu - 3) / 4) * 3; // Max raw data size per frame
+        const totalLength = payload.length + 2; // Total length includes CRC16 (2 bytes)
+        const crc = this.calculateCRC16(payload); // Calculate CRC16
+    
+        //console.log('Raw payload:', payload);
+        //console.log('Total length:', totalLength);
+        //console.log('CRC16:', crc);
+    
+        const frames = [];
+        let offset = 0;
+    
+        // Create the initial or initial-final frame
+        const initialBodySize = Math.min(MTU_BODY_SIZE - 2, payload.length);
+        const initialBody = new Uint8Array(initialBodySize + 2);
+        initialBody[0] = (totalLength >> 8) & 0xFF; // Total length (big-endian)
+        initialBody[1] = totalLength & 0xFF;
+        initialBody.set(payload.slice(0, initialBodySize), 2);
+    
+        //console.log('Initial frame raw body:', initialBody);
+    
+        const isInitialFinal = payload.length <= (MTU_BODY_SIZE - 4); // Check if it fits in one frame
+        const initialFrameBody = isInitialFinal
+            ? new Uint8Array([...initialBody, (crc >> 8) & 0xFF, crc & 0xFF]) // Add CRC16 for initial-final
+            : initialBody;
+    
+        const initialFrame = new Uint8Array([
+            0x06, 0x09, // Start marker
+            ...this.base64Encode(initialFrameBody).split('').map(c => c.charCodeAt(0)), // Base64 encoded body
+            0x0A // Frame termination
+        ]);
+        frames.push(initialFrame);
+        offset += initialBodySize;
+    
+        //console.log('Initial frame:', initialFrame);
+    
+        if (isInitialFinal) {
+            // If the entire payload fits in the initial-final frame, return the frames
+            return frames;
+        }
+    
+        // Create partial frames
+        while (offset < payload.length) {
+            const bodySize = Math.min(MTU_BODY_SIZE, payload.length - offset);
+            const body = payload.slice(offset, offset + bodySize);
+            offset += bodySize;
+    
+            const isFinal = offset >= payload.length;
+            const frameStartMarker = isFinal ? [0x04, 0x15] : [0x04, 0x14]; // Partial-final or partial
+            const frameBody = isFinal
+                ? new Uint8Array([...body, (crc >> 8) & 0xFF, crc & 0xFF]) // Add CRC16 for final frame
+                : body;
+    
+            //console.log('Partial frame raw body:', frameBody);
+    
+            const frame = new Uint8Array([
+                ...frameStartMarker, // Start marker
+                ...this.base64Encode(frameBody).split('').map(c => c.charCodeAt(0)), // Base64 encoded body
+                0x0A // Frame termination
+            ]);
+            frames.push(frame);
+    
+            //console.log('Partial frame:', frame);
+        }
+    
+        return frames;
+    }
+
+    async sendSerialMessage(data) {
+        if (!this._writer) {
+            this._logger.error('Serial device not connected.');
+            return;
+        }
+    
+        try {
+            const frames = this.wrapSMPForSerial(data); // Wrap the SMP payload into frames
+            for (const frame of frames) {
+                await this._writer.write(frame);
+                //this._logger.info('Serial frame sent:', frame);
+            }
+        } catch (error) {
+            this._logger.error('Failed to send serial message:', error);
+        }
+    }
+
+    async receiveSerialMessage() {
+        if (!this._reader) {
+            this._logger.error('Serial device not connected.');
+            return;
+        }
+
+        try {
+            const { value, done } = await this._reader.read();
+            if (done) {
+                this._logger.info('Serial connection closed.');
+                return null;
+            }
+            this._logger.info('Serial message received:', value);
+            return value;
+        } catch (error) {
+            this._logger.error('Failed to receive serial message:', error);
+        }
+    }
+
+    async _listenForSerialData() {
+        try {
+            let buffer = '';
+            let assembledPacket = new Uint8Array(); // Buffer to assemble the complete SMP packet
+            let expectedLength = null; // Expected total length of the SMP packet
+    
+            while (this._reader) {
+                const { value, done } = await this._reader.read();
+                if (done) {
+                    this._logger.info('Serial connection closed.');
+                    break;
+                }
+                if (value) {
+                    buffer += String.fromCharCode(...value);
+                    const frames = buffer.split('\n'); // Split by newline character
+                    buffer = frames.pop(); // Keep incomplete frame in the buffer
+                    console.log('frames:', frames, 'buffer:', buffer);
+    
+                    for (const frame of frames) {
+                        try {
+                            console.log('Received frame:', frame);
+    
+                            const decodedFrame = this.base64Decode(frame.slice(2, -1)); // Decode Base64 body
+                            console.log('Decoded frame:', decodedFrame);
+    
+                            const startMarker = frame.slice(0, 2);
+                            console.log('Start marker (hex):', [...startMarker].map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join(' '));
+    
+                            if (startMarker === '\x06\x09') {
+                                // Initial or initial-final frame
+                                const totalLength = (decodedFrame[0] << 8) | decodedFrame[1]; // Includes CRC16
+                                const body = decodedFrame.slice(2); // Exclude length
+                                console.log('Extracted total length (including CRC):', totalLength);
+                                console.log('Extracted body:', body);
+    
+                                // Start assembling the packet
+                                assembledPacket = body;
+                                expectedLength = totalLength; // Total length already includes CRC16
+                            } else if (startMarker === '\x04\x14' || startMarker === '\x04\x15') {
+                                // Partial or partial-final frame
+                                const body = decodedFrame; // No CRC in intermediate frames
+                                console.log('Extracted body from partial frame:', body);
+    
+                                // Append the body to the assembled packet
+                                assembledPacket = new Uint8Array([...assembledPacket, ...body]);
+                            }
+    
+                            // Check if the packet is complete
+                            console.log('Assembled packet length:', assembledPacket.length);
+                            console.log('Expected length:', expectedLength);
+                            if (assembledPacket.length === expectedLength - 3) {
+                                console.log('Complete SMP packet received:', assembledPacket);
+    
+                                // Extract the CRC16 from the assembled packet
+                                const crc = (assembledPacket[assembledPacket.length - 2] << 8) |
+                                            assembledPacket[assembledPacket.length - 1];
+                                const body = assembledPacket.slice(0, -2); // Exclude CRC16
+                                console.log('Extracted CRC:', crc);
+                                console.log('Assembled body:', body);
+    
+                                // Validate the CRC16
+                                const calculatedCRC = this.calculateCRC16(body);
+                                console.log('Calculated CRC:', calculatedCRC);
+    
+                                if (calculatedCRC !== crc) {
+                                    console.warn('CRC mismatch');
+                                    assembledPacket = new Uint8Array(); // Reset the buffer
+                                    expectedLength = null; // Reset the expected length
+                                    //continue;
+                                }
+    
+                                // Notify with the complete packet
+                                this._notification({ target: { value: body } });
+                                assembledPacket = new Uint8Array(); // Reset the buffer
+                                expectedLength = null; // Reset the expected length
+                            }
+                        } catch (error) {
+                            this._logger.error('Failed to process frame:', error);
+                        }
+                    }
+                }
+            }
+        } catch (error) {
+            this._logger.error('Error reading from serial device:', error);
+        }
+    }
+
     _connect() {
         setTimeout(async () => {
             try {
@@ -247,13 +512,16 @@ class MCUManager {
         const message = new Uint8Array(event.target.value.buffer || event.target.value);
         this._buffer = new Uint8Array([...this._buffer, ...message]);
         const messageLength = this._buffer[2] * 256 + this._buffer[3];
-        if (this._buffer.length < messageLength + 8) return;
+        if (this._buffer.length < messageLength + 8) {
+            console.log('Buffer not full yet', this._buffer.length, messageLength + 8);
+            //return;
+        };
         this._processMessage(this._buffer.slice(0, messageLength + 8));
         this._buffer = this._buffer.slice(messageLength + 8);
     }
 
     _processMessage(message) {
-        //console.log('message received', message);
+        console.log('message received', message);
         const [op, _flags, length_hi, length_lo, group_hi, group_lo, _seq, id] = message;
         const data = CBOR.decode(message.slice(8).buffer);
         const length = length_hi * 256 + length_lo;
