@@ -1,4 +1,3 @@
-
 // Opcodes
 export const MGMT_OP_READ = 0;
 export const MGMT_OP_READ_RSP = 1;
@@ -33,13 +32,18 @@ export const IMG_MGMT_ID_CORELIST = 3;
 export const IMG_MGMT_ID_CORELOAD = 4;
 export const IMG_MGMT_ID_ERASE = 5;
 
+// FS group
+export const FS_MGMT_ID_FILE_UPLOAD_DOWNLOAD = 0;
+export const FS_MGMT_ID_FILE_STATUS = 1;
+export const FS_MGMT_ID_FILE_CLOSE = 4;
+
 import CBOR from './cbor';
 
 class MCUManager {
     constructor(di = {}) {
         this.SERVICE_UUID = '8d53dc1d-1db7-4cd3-868b-8a527460aa84';
         this.CHARACTERISTIC_UUID = 'da2e7828-fbce-4e01-ae9e-261174997c48';
-        this._mtu = 400;
+        this._mtu = 244; // default MTU size
         this._device = null;
         this._service = null;
         this._characteristic = null;
@@ -55,6 +59,7 @@ class MCUManager {
         this._seq = 0;
         this._userRequestedDisconnect = false;
     }
+
     async _requestDevice(filters) {
         console.log(filters);
         const params = {
@@ -67,6 +72,7 @@ class MCUManager {
         }
         return navigator.bluetooth.requestDevice(params);
     }
+
     async connect(filters) {
         try {
             this._device = await this._requestDevice(filters);
@@ -101,6 +107,8 @@ class MCUManager {
                 this._logger.info(`Notifications enabled.`);
                 await this._characteristic.startNotifications();
                 this._logger.info(`Notifications started.`);
+                this._mtu = server.mtu || this._mtu;
+                this._logger.info(`MTU size: ${this._mtu} bytes`);
                 await this._connected();
                 this._logger.info(`Connected.`);
                 if (this._uploadIsInProgress) {
@@ -112,37 +120,56 @@ class MCUManager {
             }
         }, 1000);
     }
+
     disconnect() {
         this._userRequestedDisconnect = true;
         return this._device.gatt.disconnect();
     }
+
     onConnecting(callback) {
         this._connectingCallback = callback;
         return this;
     }
+
     onConnect(callback) {
         this._connectCallback = callback;
         return this;
     }
+
     onDisconnect(callback) {
         this._disconnectCallback = callback;
         return this;
     }
+
     onMessage(callback) {
         this._messageCallback = callback;
         return this;
     }
+
     onImageUploadProgress(callback) {
         this._imageUploadProgressCallback = callback;
         return this;
     }
+
+    onFsUploadProgress(callback) {
+        this._fsUploadProgressCallback = callback;
+        return this;
+    }
+
     onImageUploadFinished(callback) {
         this._imageUploadFinishedCallback = callback;
         return this;
     }
+
+    onFsUploadFinished(callback) {
+        this._fsUploadFinishedCallback = callback;
+        return this;
+    }
+
     async _connected() {
         if (this._connectCallback) this._connectCallback();
     }
+
     async _disconnected() {
         this._logger.info('Disconnected.');
         if (this._disconnectCallback) this._disconnectCallback();
@@ -152,38 +179,79 @@ class MCUManager {
         this._uploadIsInProgress = false;
         this._userRequestedDisconnect = false;
     }
+
     get name() {
         return this._device && this._device.name;
     }
+
+    sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    splitBuffer(buffer, chunkSize = 20) {
+        const chunks = [];
+        const byteArray = new Uint8Array(buffer);
+
+        for (let i = 0; i < byteArray.length; i += chunkSize) {
+            chunks.push(byteArray.slice(i, i + chunkSize));
+        }
+
+        return chunks;
+    }
+
+    async writeLargeBuffer(buffer, characteristic, mtu = 20, delayMs = 1) {
+        const chunks = this.splitBuffer(buffer, mtu);
+        for (const chunk of chunks) {
+            try {
+                // No await — fire and forget
+                console.log('Writing chunk', chunk.length, chunk);
+                characteristic.writeValueWithoutResponse(chunk);
+            } catch (e) {
+                console.warn("Write failed:", e);
+                await this.sleep(delayMs * 2); // backoff before retry
+                continue;
+            }
+            await this.sleep(delayMs); // prevent BLE buffer overflow
+        }
+    }
+
     async _sendMessage(op, group, id, data) {
         const _flags = 0;
         let encodedData = [];
         if (typeof data !== 'undefined') {
             encodedData = [...new Uint8Array(CBOR.encode(data))];
         }
-        if (this._characteristic == null) {
-            return;
-        }
+    
         const length_lo = encodedData.length & 255;
         const length_hi = encodedData.length >> 8;
         const group_lo = group & 255;
         const group_hi = group >> 8;
-        const message = [op, _flags, length_hi, length_lo, group_hi, group_lo, this._seq, id, ...encodedData];
-        // console.log('>'  + message.map(x => x.toString(16).padStart(2, '0')).join(' '));
-        await this._characteristic.writeValueWithoutResponse(Uint8Array.from(message));
+        const message = [
+            op, // Opcode
+            _flags, // Flags
+            length_hi, length_lo, // Length
+            group_hi, group_lo, // Group ID
+            this._seq, // Sequence number
+            id, // Command ID
+            ...encodedData // Encoded data
+        ];
+    
+        //console.log('Constructed raw payload:', message);
+    
+        this.writeLargeBuffer(Uint8Array.from(message), this._characteristic, this._mtu, 5);
+    
         this._seq = (this._seq + 1) % 256;
     }
+
     _notification(event) {
-        // console.log('message received');
-        const message = new Uint8Array(event.target.value.buffer);
-        // console.log(message);
-        // console.log('<'  + [...message].map(x => x.toString(16).padStart(2, '0')).join(' '));
+        const message = new Uint8Array(event.target.value.buffer || event.target.value);
         this._buffer = new Uint8Array([...this._buffer, ...message]);
         const messageLength = this._buffer[2] * 256 + this._buffer[3];
         if (this._buffer.length < messageLength + 8) return;
         this._processMessage(this._buffer.slice(0, messageLength + 8));
         this._buffer = this._buffer.slice(messageLength + 8);
     }
+
     _processMessage(message) {
         //console.log('message received', message);
         const [op, _flags, length_hi, length_lo, group_hi, group_lo, _seq, id] = message;
@@ -201,29 +269,62 @@ class MCUManager {
             }
             return;
         }
+
+        if (group === MGMT_GROUP_ID_FS && id === FS_MGMT_ID_FILE_UPLOAD_DOWNLOAD){
+            if ((data.rc === 0 || data.rc === undefined) && data.off) {
+                // Clear timeout since we received a response
+                if (this._uploadTimeout) {
+                    clearTimeout(this._uploadTimeout);
+                }
+                this._uploadOffset = data.off;
+                if (this._uploadIsInProgress) {
+                    this._uploadNextFileSystem();
+                }
+                return;
+            } else if (data.rc !== 0) {
+                this._logger.error('Error uploading file:', data.rc);
+                if (this._uploadTimeout) {
+                    clearTimeout(this._uploadTimeout);
+                }
+                if (this._uploadIsInProgress) {
+                    this._fsUploadFinishedCallback(false);
+                    this._uploadIsInProgress = false;
+                }
+            }
+        }
+
         if (this._messageCallback) this._messageCallback({ op, group, id, data, length });
+        
     }
+
     cmdReset() {
         return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_OS, OS_MGMT_ID_RESET);
     }
+
     smpEcho(message) {
         return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_OS, OS_MGMT_ID_ECHO, { d: message });
     }
+
     cmdImageState() {
         return this._sendMessage(MGMT_OP_READ, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_STATE);
     }
+
     cmdImageErase(slot = 1) {
         return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_ERASE);
     }
+
     cmdImageTest(hash) {
         return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_STATE, { hash, confirm: false });
     }
+
     cmdImageConfirm(hash) {
         return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_STATE, { hash, confirm: true });
     }
+
     _hash(image) {
         return crypto.subtle.digest('SHA-256', image);
     }
+
     async _uploadNext() {
         if (this._uploadOffset >= this._uploadImage.byteLength || !this._uploadIsInProgress) {
             this._uploadIsInProgress = false;
@@ -264,6 +365,7 @@ class MCUManager {
         }
             
     }
+
     async cmdUpload(image, imageNumber = 0, slot = 0) {
         if (this._uploadIsInProgress) {
             this._logger.error('Upload is already in progress.');
@@ -280,6 +382,7 @@ class MCUManager {
 
         this._uploadNext();
     }
+
     async imageInfo(image) {
         // https://interrupt.memfault.com/blog/mcuboot-overview#mcuboot-image-binaries
 
@@ -327,6 +430,68 @@ class MCUManager {
         info.hash = [...new Uint8Array(await this._hash(image.slice(0, imageSize + headerSize)))].map(b => b.toString(16).padStart(2, '0')).join('');
 
         return info;
+    }
+
+    async cmdUploadFileSystemImage(image, path) {
+        if (this._uploadIsInProgress) {
+            this._logger.error('Upload is already in progress.');
+            return;
+        }
+        this._logger.info(`Starting upload of image to ${path}... of ${image.byteLength} bytes`);
+        this._uploadIsInProgress = true;
+        this._logger.info(`Image size: ${image.byteLength} bytes`);
+        this._logger.info(`MTU size: ${this._mtu} bytes`);
+        this._uploadOffset = 0;
+        this._uploadImage = image;
+        this._uploadName = path;
+
+        this._uploadNextFileSystem();
+    }
+
+    async _uploadNextFileSystem() {
+        if (this._uploadOffset >= this._uploadImage.byteLength || !this._uploadIsInProgress) {
+            this._uploadIsInProgress = false;
+            console.log('Upload finished');
+            this._fsUploadFinishedCallback(true);
+            return;
+        }
+
+        // Clear any existing timeout
+        if (this._uploadTimeout) {
+            clearTimeout(this._uploadTimeout);
+        }
+        // Set new timeout
+        this._uploadTimeout = setTimeout(() => {
+            this._logger.info('Upload chunk timeout, retry');
+            //this._uploadNextFileSystem();
+        }, this._chunkTimeout);
+
+        const nmpOverhead = 20;
+        const message = { data: new Uint8Array(), off: this._uploadOffset, name: this._uploadName };
+        if (this._uploadOffset === 0) {
+            message.len = this._uploadImage.byteLength;
+        }
+        this._fsUploadProgressCallback({ percentage: Math.floor(this._uploadOffset / this._uploadImage.byteLength * 100) });
+
+        let length = this._netbuf_size - CBOR.encode(message).byteLength - nmpOverhead;
+
+        length = length - (length % 4);
+
+
+        console.log('New length:', length, 'offset', this._uploadOffset);
+
+        message.data = new Uint8Array(this._uploadImage.slice(this._uploadOffset, this._uploadOffset + length));
+
+        // Keep offset for retry
+        // this._uploadOffset += length;
+        try {
+            this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_FS, FS_MGMT_ID_FILE_UPLOAD_DOWNLOAD, message);
+        } catch (error) {
+            this._logger.error('Error sending upload message:', error);
+            clearTimeout(this._uploadTimeout);
+            return;
+        }
+            
     }
 }
 
