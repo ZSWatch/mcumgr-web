@@ -44,6 +44,7 @@ class MCUManager {
         this.SERVICE_UUID = '8d53dc1d-1db7-4cd3-868b-8a527460aa84';
         this.CHARACTERISTIC_UUID = 'da2e7828-fbce-4e01-ae9e-261174997c48';
         this._mtu = 244; // default MTU size
+        this._netbuf_size = 2450; // default netbuf size
         this._device = null;
         this._service = null;
         this._characteristic = null;
@@ -53,7 +54,8 @@ class MCUManager {
         this._messageCallback = null;
         this._imageUploadProgressCallback = null;
         this._uploadIsInProgress = false;
-        this._chunkTimeout = 500; // 500ms, if sending a chunk is not completed in this time, it will be retried (even 250ms can be too low for some devices)
+        this._chunkTimeout = 5000; // 500ms, if sending a chunk is not completed in this time, it will be retried (even 250ms can be too low for some devices)
+        this._retryCount = 0;
         this._buffer = new Uint8Array();
         this._logger = di.logger || { info: console.log, error: console.error };
         this._seq = 0;
@@ -204,7 +206,7 @@ class MCUManager {
         for (const chunk of chunks) {
             try {
                 // No await — fire and forget
-                console.log('Writing chunk', chunk.length, chunk);
+                // console.log('Writing chunk', chunk.length, chunk);
                 characteristic.writeValueWithoutResponse(chunk);
             } catch (e) {
                 console.warn("Write failed:", e);
@@ -267,6 +269,7 @@ class MCUManager {
             if (this._uploadIsInProgress) {    
                 this._uploadNext();
             }
+            this._retryCount = 0;
             return;
         }
 
@@ -275,20 +278,31 @@ class MCUManager {
                 // Clear timeout since we received a response
                 if (this._uploadTimeout) {
                     clearTimeout(this._uploadTimeout);
+                    console.log('Upload timeout cleared');
                 }
                 this._uploadOffset = data.off;
                 if (this._uploadIsInProgress) {
                     this._uploadNextFileSystem();
                 }
+
+                this._retryCount = 0;
                 return;
             } else if (data.rc !== 0) {
                 this._logger.error('Error uploading file:', data.rc);
                 if (this._uploadTimeout) {
                     clearTimeout(this._uploadTimeout);
+                    console.log('Upload timeout cleared');
                 }
-                if (this._uploadIsInProgress) {
-                    this._fsUploadFinishedCallback(false);
-                    this._uploadIsInProgress = false;
+                if (this._retryCount < 3) {
+                    this._logger.info('Retrying upload...');
+                    this._retryCount++;
+                    this._uploadNextFileSystem();
+                } else {
+                    this._logger.error('Upload failed after 3 retries');
+                    if (this._uploadIsInProgress) {
+                        this._fsUploadFinishedCallback(false);
+                        this._uploadIsInProgress = false;
+                    }
                 }
             }
         }
@@ -376,6 +390,7 @@ class MCUManager {
         this._logger.info(`Image size: ${image.byteLength} bytes`);
         this._logger.info(`MTU size: ${this._mtu} bytes`);
         this._uploadOffset = 0;
+        this._retryCount = 0;
         this._uploadImage = image;
         this._uploadImageNumber = imageNumber;
         this._uploadSlot = slot;
@@ -442,6 +457,7 @@ class MCUManager {
         this._logger.info(`Image size: ${image.byteLength} bytes`);
         this._logger.info(`MTU size: ${this._mtu} bytes`);
         this._uploadOffset = 0;
+        this._retryCount = 0;
         this._uploadImage = image;
         this._uploadName = path;
 
@@ -463,7 +479,7 @@ class MCUManager {
         // Set new timeout
         this._uploadTimeout = setTimeout(() => {
             this._logger.info('Upload chunk timeout, retry');
-            //this._uploadNextFileSystem();
+            this._uploadNextFileSystem();
         }, this._chunkTimeout);
 
         const nmpOverhead = 20;
@@ -477,8 +493,7 @@ class MCUManager {
 
         length = length - (length % 4);
 
-
-        console.log('New length:', length, 'offset', this._uploadOffset);
+        console.log('File offset', this._uploadOffset);
 
         message.data = new Uint8Array(this._uploadImage.slice(this._uploadOffset, this._uploadOffset + length));
 
