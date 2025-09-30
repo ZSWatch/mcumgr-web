@@ -39,6 +39,24 @@ export const FS_MGMT_ID_FILE_CLOSE = 4;
 
 import CBOR from './cbor';
 
+// Serial frame states
+const SERIAL_FRAME_STATE = {
+    IDLE: 'idle',
+    RECV_PKT_SECOND: 'recv_pkt_second',
+    RECV_FRAG_SECOND: 'recv_frag_second',
+    COLLECT_PKT: 'collect_pkt',
+    COLLECT_FRAG: 'collect_frag'
+};
+
+const MCUMGR_SERIAL_HDR_PKT = 0x0609;
+const MCUMGR_SERIAL_HDR_FRAG = 0x0414;
+const MCUMGR_SERIAL_MAX_FRAME = 127;
+const MCUMGR_SERIAL_HDR_PKT_1 = MCUMGR_SERIAL_HDR_PKT >> 8;
+const MCUMGR_SERIAL_HDR_PKT_2 = MCUMGR_SERIAL_HDR_PKT & 0xff;
+const MCUMGR_SERIAL_HDR_FRAG_1 = MCUMGR_SERIAL_HDR_FRAG >> 8;
+const MCUMGR_SERIAL_HDR_FRAG_2 = MCUMGR_SERIAL_HDR_FRAG & 0xff;
+const SERIAL_NEWLINE = 0x0a;
+
 class MCUManager {
     constructor(di = {}) {
         this.SERVICE_UUID = '8d53dc1d-1db7-4cd3-868b-8a527460aa84';
@@ -60,6 +78,46 @@ class MCUManager {
         this._logger = di.logger || { info: console.log, error: console.error };
         this._seq = 0;
         this._userRequestedDisconnect = false;
+        this._transport = di.transport || 'ble';
+        this._bleDisconnectListener = null;
+        this._serialPort = null;
+        this._serialReader = null;
+        this._serialWriter = null;
+        this._serialReadLoopActive = false;
+        this._serialReadLoopPromise = null;
+        this._serialReadChunkSize = di.serialReadChunkSize || 512;
+        this._serialWriteChunkSize = di.serialWriteChunkSize || 512;
+        this._serialDisconnectListener = null;
+        this._serialFrameState = SERIAL_FRAME_STATE.IDLE;
+        this._serialCurrentFrame = [];
+        this._serialRxContext = {
+            buffer: new Uint8Array(),
+            expectedLength: null
+        };
+        this._deviceName = null;
+    }
+
+    setTransport(transport) {
+        if (!['ble', 'serial'].includes(transport)) {
+            throw new Error(`Unsupported transport: ${transport}`);
+        }
+        this._transport = transport;
+        return this;
+    }
+
+    _normalizeConnectOptions(options) {
+        let transport = this._transport || 'ble';
+        let filters = null;
+        let serial = {};
+
+        if (Array.isArray(options) || options === null) {
+            filters = options;
+        } else if (options && typeof options === 'object') {
+            transport = options.transport || transport;
+            filters = options.filters ?? null;
+        }
+
+        return { transport, filters };
     }
 
     async _requestDevice(filters) {
@@ -75,27 +133,48 @@ class MCUManager {
         return navigator.bluetooth.requestDevice(params);
     }
 
-    async connect(filters) {
+    async connect(options = null) {
+        const { transport, filters } = this._normalizeConnectOptions(options);
+        this.setTransport(transport);
+
+        if (transport === 'ble') {
+            return this._connectBle(filters);
+        } else if (transport === 'serial') {
+            return this._connectSerial();
+        }
+
+        throw new Error(`Unsupported transport: ${transport}`);
+    }
+
+    async _connectBle(filters) {
         try {
+            if (this._bleDisconnectListener && this._device) {
+                this._device.removeEventListener('gattserverdisconnected', this._bleDisconnectListener);
+            }
+
             this._device = await this._requestDevice(filters);
-            this._logger.info(`Connecting to device ${this.name}...`);
-            this._device.addEventListener('gattserverdisconnected', async event => {
+            this._deviceName = this._device && this._device.name ? this._device.name : 'BLE Device';
+            this._logger.info(`Connecting to device ${this.name || 'unknown'} over BLE...`);
+
+            this._bleDisconnectListener = async event => {
                 this._logger.info(event);
                 if (!this._userRequestedDisconnect) {
                     this._logger.info('Trying to reconnect');
-                    this._connect(1000);
+                    this._connectBleWithDelay(1000);
                 } else {
                     this._disconnected();
                 }
-            });
-            this._connect(0);
+            };
+
+            this._device.addEventListener('gattserverdisconnected', this._bleDisconnectListener);
+            this._connectBleWithDelay(0);
         } catch (error) {
             this._logger.error(error);
             await this._disconnected();
-            return;
         }
     }
-    _connect() {
+
+    _connectBleWithDelay(delay = 1000) {
         setTimeout(async () => {
             try {
                 if (this._connectingCallback) this._connectingCallback();
@@ -111,6 +190,9 @@ class MCUManager {
                 this._logger.info(`Notifications started.`);
                 this._mtu = server.mtu || this._mtu;
                 this._logger.info(`MTU size: ${this._mtu} bytes`);
+                if (this._device && this._device.name) {
+                    this._deviceName = this._device.name;
+                }
                 await this._connected();
                 this._logger.info(`Connected.`);
                 if (this._uploadIsInProgress) {
@@ -120,12 +202,201 @@ class MCUManager {
                 this._logger.error(error);
                 await this._disconnected();
             }
-        }, 1000);
+        }, delay);
     }
 
-    disconnect() {
+    async _connectSerial() {
+        try {
+            if (!navigator.serial) {
+                throw new Error('Web Serial is not supported in this browser.');
+            }
+
+            this._logger.info('Requesting serial port...');
+            this._serialPort = await navigator.serial.requestPort();
+            this._device = this._serialPort;
+
+            if (this._connectingCallback) this._connectingCallback();
+
+            const openOptions = {
+                baudRate: 115200,
+            };
+
+            await this._serialPort.open(openOptions);
+
+            if (this._serialWriter) {
+                try {
+                    await this._serialWriter.close();
+                } catch (e) {
+                    this._logger.error('Serial writer close error:', e);
+                }
+                this._serialWriter = null;
+            }
+
+            this._serialWriter = this._serialPort.writable ? this._serialPort.writable.getWriter() : null;
+            this._serialReadLoopActive = true;
+            this._serialFrameState = SERIAL_FRAME_STATE.IDLE;
+            this._serialCurrentFrame = [];
+            this._serialRxContext = {
+                buffer: new Uint8Array(),
+                expectedLength: null
+            };
+            this._buffer = new Uint8Array();
+
+            this._mtu = 512;
+
+            this._deviceName = "ZSWatch Serial";
+
+            if (!this._serialDisconnectListener) {
+                this._serialDisconnectListener = event => {
+                    if (event.port === this._serialPort) {
+                        this._logger.info('Serial port disconnected.');
+                        this._disconnectSerial(true);
+                    }
+                };
+                navigator.serial.addEventListener('disconnect', this._serialDisconnectListener);
+            }
+
+            this._logger.info('Serial port opened.');
+
+            await this._connected();
+
+            this._startSerialReadLoop();
+
+            if (this._uploadIsInProgress) {
+                this._uploadNext();
+            }
+
+            return this._serialPort;
+        } catch (error) {
+            this._logger.error(error);
+            await this._disconnected();
+        }
+    }
+
+    _startSerialReadLoop() {
+        if (!this._serialPort || !this._serialPort.readable || !this._serialReadLoopActive) {
+            return;
+        }
+
+        this._serialReader = this._serialPort.readable.getReader();
+
+        const readLoop = async () => {
+            try {
+                while (this._serialReadLoopActive) {
+                    const { value, done } = await this._serialReader.read();
+                    if (done) {
+                        break;
+                    }
+                    if (value) {
+                        this._handleIncoming(value);
+                    }
+                }
+            } catch (error) {
+                if (this._serialReadLoopActive) {
+                    this._logger.error('Serial read error:', error);
+                }
+            } finally {
+                if (this._serialReader) {
+                    try {
+                        this._serialReader.releaseLock();
+                    } catch (releaseError) {
+                        this._logger.error('Failed to release serial reader lock:', releaseError);
+                    }
+                    this._serialReader = null;
+                }
+            }
+        };
+
+        this._serialReadLoopPromise = readLoop();
+    }
+
+    async _disconnectSerial(triggeredByEvent = false) {
+        if (!this._serialPort) {
+            if (!triggeredByEvent) {
+                await this._disconnected();
+            }
+            return;
+        }
+
+        this._serialReadLoopActive = false;
+
+        if (this._serialReader) {
+            try {
+                await this._serialReader.cancel();
+            } catch (error) {
+                this._logger.error('Error cancelling serial reader:', error);
+            }
+        }
+
+        if (this._serialReadLoopPromise) {
+            try {
+                await this._serialReadLoopPromise;
+            } catch (error) {
+                this._logger.error('Serial read loop error:', error);
+            }
+            this._serialReadLoopPromise = null;
+        }
+
+        if (this._serialWriter) {
+            try {
+                await this._serialWriter.close();
+            } catch (error) {
+                this._logger.error('Error closing serial writer:', error);
+            }
+            try {
+                this._serialWriter.releaseLock();
+            } catch (releaseError) {
+                this._logger.error('Failed to release serial writer lock:', releaseError);
+            }
+            this._serialWriter = null;
+        }
+
+        if (this._serialDisconnectListener) {
+            try {
+                navigator.serial.removeEventListener('disconnect', this._serialDisconnectListener);
+            } catch (error) {
+                this._logger.error('Failed to remove serial disconnect listener:', error);
+            }
+            this._serialDisconnectListener = null;
+        }
+
+        if (typeof this._serialPort?.setSignals === 'function') {
+            try {
+                await this._serialPort.setSignals({ dataTerminalReady: false });
+            } catch (error) {
+                this._logger.error('Failed to clear serial port signals:', error);
+            }
+        }
+
+        try {
+            await this._serialPort.close();
+        } catch (error) {
+            this._logger.error('Error closing serial port:', error);
+        }
+
+        this._serialPort = null;
+        this._serialFrameState = SERIAL_FRAME_STATE.IDLE;
+        this._serialCurrentFrame = [];
+        this._serialRxContext = {
+            buffer: new Uint8Array(),
+            expectedLength: null
+        };
+
+        await this._disconnected();
+    }
+
+    async disconnect() {
         this._userRequestedDisconnect = true;
-        return this._device.gatt.disconnect();
+
+        if (this._transport === 'serial') {
+            return this._disconnectSerial();
+        }
+
+        if (this._device && this._device.gatt && this._device.gatt.connected) {
+            return this._device.gatt.disconnect();
+        }
+
+        await this._disconnected();
     }
 
     onConnecting(callback) {
@@ -180,10 +451,31 @@ class MCUManager {
         this._characteristic = null;
         this._uploadIsInProgress = false;
         this._userRequestedDisconnect = false;
+        this._serialPort = null;
+        this._serialReader = null;
+        this._serialWriter = null;
+        this._serialReadLoopActive = false;
+        this._serialReadLoopPromise = null;
+        this._serialDisconnectListener = null;
+        this._serialFrameState = SERIAL_FRAME_STATE.IDLE;
+        this._serialCurrentFrame = [];
+        this._serialRxContext = {
+            buffer: new Uint8Array(),
+            expectedLength: null
+        };
+        this._deviceName = null;
     }
 
     get name() {
-        return this._device && this._device.name;
+        return this._deviceName;
+    }
+
+    isConnected() {
+        if (this._transport === 'serial') {
+            return Boolean(this._serialPort && this._serialWriter && this._serialReadLoopActive);
+        }
+
+        return Boolean(this._device && this._device.gatt && this._device.gatt.connected);
     }
 
     sleep(ms) {
@@ -205,8 +497,6 @@ class MCUManager {
         const chunks = this.splitBuffer(buffer, mtu);
         for (const chunk of chunks) {
             try {
-                // No await — fire and forget
-                // console.log('Writing chunk', chunk.length, chunk);
                 characteristic.writeValueWithoutResponse(chunk);
             } catch (e) {
                 console.warn("Write failed:", e);
@@ -215,6 +505,103 @@ class MCUManager {
             }
             await this.sleep(delayMs); // prevent BLE buffer overflow
         }
+    }
+
+    async _writeRaw(buffer) {
+        if (this._transport === 'serial') {
+            await this._writeSerial(buffer);
+        } else {
+            this.writeLargeBuffer(buffer, this._characteristic, this._mtu, 5);
+        }
+    }
+
+    async _writeSerial(buffer) {
+        if (!this._serialPort || !this._serialWriter) {
+            throw new Error('Serial port is not ready to send data.');
+        }
+
+        const payload = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+        const crc = this._crc16(payload);
+
+        const totalLength = payload.length + 2; // include CRC
+        const packetData = new Uint8Array(2 + payload.length + 2);
+        packetData[0] = (totalLength >> 8) & 0xff;
+        packetData[1] = totalLength & 0xff;
+        packetData.set(payload, 2);
+        packetData[packetData.length - 2] = (crc >> 8) & 0xff;
+        packetData[packetData.length - 1] = crc & 0xff;
+
+        const maxInput = Math.floor((MCUMGR_SERIAL_MAX_FRAME - 3) / 4) * 3;
+        let header = MCUMGR_SERIAL_HDR_PKT;
+        let offset = 0;
+
+        while (offset < packetData.length) {
+            const remaining = packetData.length - offset;
+            const chunkLen = Math.min(maxInput, remaining);
+            const chunk = packetData.slice(offset, offset + chunkLen);
+            const frame = this._buildSerialFrame(header, chunk);
+            await this._serialWriter.write(frame);
+            offset += chunkLen;
+            header = MCUMGR_SERIAL_HDR_FRAG;
+        }
+    }
+
+    _buildSerialFrame(header, chunk) {
+        const headerBytes = new Uint8Array([header >> 8, header & 0xff]);
+        const base64String = this._base64Encode(chunk);
+        const base64Bytes = this._asciiToUint8(base64String);
+        const frame = new Uint8Array(headerBytes.length + base64Bytes.length + 1);
+        frame.set(headerBytes, 0);
+        frame.set(base64Bytes, headerBytes.length);
+        frame[frame.length - 1] = SERIAL_NEWLINE;
+        return frame;
+    }
+
+    _base64Encode(bytes) {
+        if (!bytes || bytes.length === 0) {
+            return '';
+        }
+
+        let binary = '';
+        for (let i = 0; i < bytes.length; i += 1) {
+            binary += String.fromCharCode(bytes[i]);
+        }
+
+        return btoa(binary);
+    }
+
+    _base64Decode(str) {
+        if (!str) {
+            return new Uint8Array();
+        }
+
+        try {
+            const binary = atob(str);
+            const output = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i += 1) {
+                output[i] = binary.charCodeAt(i);
+            }
+            return output;
+        } catch (error) {
+            this._logger.error('Failed to decode base64 serial frame:', error);
+            return null;
+        }
+    }
+
+    _asciiToUint8(str) {
+        const arr = new Uint8Array(str.length);
+        for (let i = 0; i < str.length; i += 1) {
+            arr[i] = str.charCodeAt(i);
+        }
+        return arr;
+    }
+
+    _uint8ToAscii(bytes) {
+        let result = '';
+        for (let i = 0; i < bytes.length; i += 1) {
+            result += String.fromCharCode(bytes[i]);
+        }
+        return result;
     }
 
     async _sendMessage(op, group, id, data) {
@@ -240,18 +627,260 @@ class MCUManager {
     
         //console.log('Constructed raw payload:', message);
     
-        this.writeLargeBuffer(Uint8Array.from(message), this._characteristic, this._mtu, 5);
-    
+        await this._writeRaw(Uint8Array.from(message));
+
         this._seq = (this._seq + 1) % 256;
     }
 
     _notification(event) {
-        const message = new Uint8Array(event.target.value.buffer || event.target.value);
-        this._buffer = new Uint8Array([...this._buffer, ...message]);
-        const messageLength = this._buffer[2] * 256 + this._buffer[3];
-        if (this._buffer.length < messageLength + 8) return;
-        this._processMessage(this._buffer.slice(0, messageLength + 8));
-        this._buffer = this._buffer.slice(messageLength + 8);
+        if (!event || !event.target) {
+            return;
+        }
+        this._handleIncoming(event.target.value);
+    }
+
+    _handleIncoming(data) {
+        if (!data) {
+            return;
+        }
+
+        const normalizedData = this._normalizeIncomingData(data);
+        if (!normalizedData) {
+            return;
+        }
+
+        if (this._transport === 'serial') {
+            this._handleSerialBytes(normalizedData);
+        } else {
+            this._appendToMessageBuffer(normalizedData);
+        }
+    }
+
+    _normalizeIncomingData(data) {
+        if (!data) {
+            return null;
+        }
+
+        if (data instanceof Uint8Array) {
+            return data;
+        }
+
+        if (ArrayBuffer.isView(data)) {
+            return new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+        }
+
+        if (data instanceof ArrayBuffer) {
+            return new Uint8Array(data);
+        }
+
+        if (Array.isArray(data)) {
+            return new Uint8Array(data);
+        }
+
+        return null;
+    }
+
+    _handleSerialBytes(bytes) {
+        for (const byte of bytes) {
+            switch (this._serialFrameState) {
+                case SERIAL_FRAME_STATE.IDLE:
+                    if (byte === MCUMGR_SERIAL_HDR_PKT_1) {
+                        this._serialFrameState = SERIAL_FRAME_STATE.RECV_PKT_SECOND;
+                        this._serialCurrentFrame = [byte];
+                    } else if (byte === MCUMGR_SERIAL_HDR_FRAG_1) {
+                        this._serialFrameState = SERIAL_FRAME_STATE.RECV_FRAG_SECOND;
+                        this._serialCurrentFrame = [byte];
+                    }
+                    break;
+                case SERIAL_FRAME_STATE.RECV_PKT_SECOND:
+                    if (byte === MCUMGR_SERIAL_HDR_PKT_2) {
+                        this._serialCurrentFrame.push(byte);
+                        this._serialFrameState = SERIAL_FRAME_STATE.COLLECT_PKT;
+                    } else {
+                        this._resetSerialFrameState();
+                        if (byte === MCUMGR_SERIAL_HDR_PKT_1 || byte === MCUMGR_SERIAL_HDR_FRAG_1) {
+                            this._serialFrameState = (byte === MCUMGR_SERIAL_HDR_PKT_1) ? SERIAL_FRAME_STATE.RECV_PKT_SECOND : SERIAL_FRAME_STATE.RECV_FRAG_SECOND;
+                            this._serialCurrentFrame = [byte];
+                        }
+                    }
+                    break;
+                case SERIAL_FRAME_STATE.RECV_FRAG_SECOND:
+                    if (byte === MCUMGR_SERIAL_HDR_FRAG_2) {
+                        this._serialCurrentFrame.push(byte);
+                        this._serialFrameState = SERIAL_FRAME_STATE.COLLECT_FRAG;
+                    } else {
+                        this._resetSerialFrameState();
+                        if (byte === MCUMGR_SERIAL_HDR_PKT_1 || byte === MCUMGR_SERIAL_HDR_FRAG_1) {
+                            this._serialFrameState = (byte === MCUMGR_SERIAL_HDR_PKT_1) ? SERIAL_FRAME_STATE.RECV_PKT_SECOND : SERIAL_FRAME_STATE.RECV_FRAG_SECOND;
+                            this._serialCurrentFrame = [byte];
+                        }
+                    }
+                    break;
+                case SERIAL_FRAME_STATE.COLLECT_PKT:
+                case SERIAL_FRAME_STATE.COLLECT_FRAG:
+                    this._serialCurrentFrame.push(byte);
+                    if (this._serialCurrentFrame.length > MCUMGR_SERIAL_MAX_FRAME) {
+                        this._logger.error('Serial frame too long, dropping');
+                        this._resetSerialFrameState();
+                        break;
+                    }
+
+                    if (byte === SERIAL_NEWLINE) {
+                        this._processSerialFrame(new Uint8Array(this._serialCurrentFrame));
+                        this._resetSerialFrameState();
+                    }
+                    break;
+                default:
+                    this._resetSerialFrameState();
+                    break;
+            }
+        }
+    }
+
+    _resetSerialFrameState() {
+        this._serialFrameState = SERIAL_FRAME_STATE.IDLE;
+        this._serialCurrentFrame = [];
+    }
+
+    _processSerialFrame(frame) {
+        if (!frame || frame.length < 3) {
+            return;
+        }
+
+        const header = (frame[0] << 8) | frame[1];
+        const bodyBytes = frame.slice(2, frame.length - 1); // remove newline
+        const bodyString = this._uint8ToAscii(bodyBytes);
+        const decoded = this._base64Decode(bodyString);
+
+        if (decoded === null) {
+            this._resetSerialPacketState();
+            return;
+        }
+        this._handleSerialFragment(header, decoded);
+    }
+
+    _handleSerialFragment(header, payload) {
+        if (!payload) {
+            this._resetSerialPacketState();
+            return;
+        }
+
+        const ctx = this._serialRxContext;
+
+        if (header === MCUMGR_SERIAL_HDR_PKT) {
+            ctx.buffer = new Uint8Array();
+            ctx.expectedLength = null;
+        } else if (header === MCUMGR_SERIAL_HDR_FRAG) {
+            if (ctx.expectedLength == null && ctx.buffer.length === 0) {
+                this._logger.error('Received serial fragment without initial packet');
+                this._resetSerialPacketState();
+                return;
+            }
+        } else {
+            this._logger.error(`Unknown serial frame header: 0x${header.toString(16)}`);
+            this._resetSerialPacketState();
+            return;
+        }
+
+        ctx.buffer = this._concatUint8Arrays(ctx.buffer, payload);
+
+        if (header === MCUMGR_SERIAL_HDR_PKT) {
+            if (ctx.buffer.length < 2) {
+                // wait for length bytes
+                return;
+            }
+            ctx.expectedLength = (ctx.buffer[0] << 8) | ctx.buffer[1];
+            ctx.buffer = ctx.buffer.slice(2);
+        } else {
+        }
+
+        if (ctx.expectedLength == null) {
+            return;
+        }
+
+        if (ctx.buffer.length < ctx.expectedLength) {
+            return;
+        }
+
+        if (ctx.buffer.length > ctx.expectedLength) {
+            this._logger.error('Serial packet buffer longer than expected length; dropping');
+            this._resetSerialPacketState();
+            return;
+        }
+
+        const crcInput = ctx.buffer;
+        const crc = this._crc16(crcInput);
+        if (crc !== 0) {
+            this._logger.error('Serial CRC mismatch (crc=' + crc + ')');
+            this._resetSerialPacketState();
+            return;
+        }
+
+        const payloadData = crcInput.slice(0, crcInput.length - 2);
+        this._appendToMessageBuffer(payloadData);
+
+        this._resetSerialPacketState();
+    }
+
+    _resetSerialPacketState() {
+        this._serialRxContext = {
+            buffer: new Uint8Array(),
+            expectedLength: null
+        };
+    }
+
+    _concatUint8Arrays(a, b) {
+        const left = a ? a : new Uint8Array();
+        const right = b ? b : new Uint8Array();
+
+        if (left.length === 0) {
+            return right.slice();
+        }
+
+        if (right.length === 0) {
+            return left.slice();
+        }
+
+        const result = new Uint8Array(left.length + right.length);
+        result.set(left, 0);
+        result.set(right, left.length);
+        return result;
+    }
+
+    _crc16(data) {
+        let crc = 0x0000;
+
+        for (let i = 0; i < data.length; i += 1) {
+            crc ^= data[i] << 8;
+            for (let bit = 0; bit < 8; bit += 1) {
+                if (crc & 0x8000) {
+                    crc = ((crc << 1) ^ 0x1021) & 0xffff;
+                } else {
+                    crc = (crc << 1) & 0xffff;
+                }
+            }
+        }
+
+        return crc & 0xffff;
+    }
+
+    _appendToMessageBuffer(bytes) {
+        if (!bytes || bytes.length === 0) {
+            return;
+        }
+
+        this._buffer = new Uint8Array([...this._buffer, ...bytes]);
+
+        while (this._buffer.length >= 8) {
+            const messageLength = this._buffer[2] * 256 + this._buffer[3];
+            if (this._buffer.length < messageLength + 8) {
+                break;
+            }
+
+            const packet = this._buffer.slice(0, messageLength + 8);
+            this._processMessage(packet);
+            this._buffer = this._buffer.slice(messageLength + 8);
+        }
     }
 
     _processMessage(message) {

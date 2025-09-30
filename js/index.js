@@ -36,11 +36,6 @@ let file = null;
 let fileData = null;
 let images = [];
 
-deviceNameInput.value = localStorage.getItem('deviceName');
-deviceNameInput.addEventListener('change', () => {
-    localStorage.setItem('deviceName', deviceNameInput.value);
-});
-
 const mcumgr = new MCUManager();
 mcumgr.onConnecting(() => {
     console.log('Connecting...');
