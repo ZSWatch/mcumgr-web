@@ -976,6 +976,24 @@ class MCUManager {
         return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_IMAGE, IMG_MGMT_ID_STATE, { hash, confirm: true });
     }
 
+    cmdShellExec(command) {
+        let argv = [];
+
+        if (Array.isArray(command)) {
+            argv = command.filter(arg => typeof arg === 'string' && arg.length > 0);
+        } else if (typeof command === 'string') {
+            argv = command.trim().split(/\s+/).filter(Boolean);
+        } else {
+            throw new Error('Shell command must be a string or array');
+        }
+
+        if (argv.length === 0) {
+            return Promise.resolve();
+        }
+
+        return this._sendMessage(MGMT_OP_WRITE, MGMT_GROUP_ID_SHELL, 0, { argv });
+    }
+
     _hash(image) {
         return crypto.subtle.digest('SHA-256', image);
     }
