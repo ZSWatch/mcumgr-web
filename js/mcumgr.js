@@ -72,7 +72,8 @@ class MCUManager {
         this._messageCallback = null;
         this._imageUploadProgressCallback = null;
         this._uploadIsInProgress = false;
-        this._chunkTimeout = 5000; // 500ms, if sending a chunk is not completed in this time, it will be retried (even 250ms can be too low for some devices)
+        this._chunkTimeout = 500; // 500ms, if sending a chunk is not completed in this time, it will be retried (even 250ms can be too low for some devices)
+        this._firstChunkTimeout = 2000; // 2s for the first chunk, as it may take longer for the device to prepare
         this._retryCount = 0;
         this._buffer = new Uint8Array();
         this._logger = di.logger || { info: console.log, error: console.error };
@@ -102,6 +103,15 @@ class MCUManager {
             throw new Error(`Unsupported transport: ${transport}`);
         }
         this._transport = transport;
+        return this;
+    }
+
+    setChunkTimeout(timeout) {
+        if (typeof timeout !== 'number' || timeout <= 0) {
+            throw new Error('Chunk timeout must be a positive number');
+        }
+        this._chunkTimeout = timeout;
+        this._logger.info(`Chunk timeout set to ${timeout}ms`);
         return this;
     }
 
@@ -217,11 +227,10 @@ class MCUManager {
 
             if (this._connectingCallback) this._connectingCallback();
 
-            const openOptions = {
-                baudRate: 115200,
-            };
-
-            await this._serialPort.open(openOptions);
+            await this._serialPort.open({
+                baudRate: 1000000, // Using CDC ACM, so actual baud rate doesn't matter
+                flowControl: 'hardware'
+            });
 
             if (this._serialWriter) {
                 try {
@@ -242,13 +251,12 @@ class MCUManager {
             };
             this._buffer = new Uint8Array();
 
-            this._mtu = 512;
-
-            this._deviceName = "ZSWatch Serial";
+            this._mtu = 256;
 
             if (!this._serialDisconnectListener) {
                 this._serialDisconnectListener = event => {
-                    if (event.port === this._serialPort) {
+                    this._logger.info('Serial port disconnect event received');
+                    if (event.target === this._serialPort) {
                         this._logger.info('Serial port disconnected.');
                         this._disconnectSerial(true);
                     }
@@ -285,6 +293,7 @@ class MCUManager {
                 while (this._serialReadLoopActive) {
                     const { value, done } = await this._serialReader.read();
                     if (done) {
+                        this._logger.info('Serial stream closed');
                         break;
                     }
                     if (value) {
@@ -292,9 +301,7 @@ class MCUManager {
                     }
                 }
             } catch (error) {
-                if (this._serialReadLoopActive) {
-                    this._logger.error('Serial read error:', error);
-                }
+                this._logger.error('Serial read error:', error);
             } finally {
                 if (this._serialReader) {
                     try {
@@ -312,12 +319,11 @@ class MCUManager {
 
     async _disconnectSerial(triggeredByEvent = false) {
         if (!this._serialPort) {
-            if (!triggeredByEvent) {
-                await this._disconnected();
-            }
+            await this._disconnected();
             return;
         }
 
+        this._logger.info('Disconnecting serial port...');
         this._serialReadLoopActive = false;
 
         if (this._serialReader) {
@@ -330,7 +336,10 @@ class MCUManager {
 
         if (this._serialReadLoopPromise) {
             try {
-                await this._serialReadLoopPromise;
+                await Promise.race([
+                    this._serialReadLoopPromise,
+                    new Promise((resolve) => setTimeout(resolve, 1000)) // 1 second timeout
+                ]);
             } catch (error) {
                 this._logger.error('Serial read loop error:', error);
             }
@@ -342,11 +351,6 @@ class MCUManager {
                 await this._serialWriter.close();
             } catch (error) {
                 this._logger.error('Error closing serial writer:', error);
-            }
-            try {
-                this._serialWriter.releaseLock();
-            } catch (releaseError) {
-                this._logger.error('Failed to release serial writer lock:', releaseError);
             }
             this._serialWriter = null;
         }
@@ -364,7 +368,7 @@ class MCUManager {
             try {
                 await this._serialPort.setSignals({ dataTerminalReady: false });
             } catch (error) {
-                this._logger.error('Failed to clear serial port signals:', error);
+                // Ignore signal errors on disconnect - device may already be gone
             }
         }
 
@@ -375,6 +379,7 @@ class MCUManager {
         }
 
         this._serialPort = null;
+        this._serialReader = null;
         this._serialFrameState = SERIAL_FRAME_STATE.IDLE;
         this._serialCurrentFrame = [];
         this._serialRxContext = {
@@ -445,7 +450,9 @@ class MCUManager {
 
     async _disconnected() {
         this._logger.info('Disconnected.');
-        if (this._disconnectCallback) this._disconnectCallback();
+        if (this._disconnectCallback) {
+            this._disconnectCallback();
+        }
         this._device = null;
         this._service = null;
         this._characteristic = null;
@@ -535,14 +542,19 @@ class MCUManager {
         let header = MCUMGR_SERIAL_HDR_PKT;
         let offset = 0;
 
-        while (offset < packetData.length) {
-            const remaining = packetData.length - offset;
-            const chunkLen = Math.min(maxInput, remaining);
-            const chunk = packetData.slice(offset, offset + chunkLen);
-            const frame = this._buildSerialFrame(header, chunk);
-            await this._serialWriter.write(frame);
-            offset += chunkLen;
-            header = MCUMGR_SERIAL_HDR_FRAG;
+        try {
+            while (offset < packetData.length) {
+                const remaining = packetData.length - offset;
+                const chunkLen = Math.min(maxInput, remaining);
+                const chunk = packetData.slice(offset, offset + chunkLen);
+                const frame = this._buildSerialFrame(header, chunk);
+                await this._serialWriter.write(frame);
+                offset += chunkLen;
+                header = MCUMGR_SERIAL_HDR_FRAG;
+            }
+        } catch (error) {
+            this._logger.error('Serial write error:', error);
+            throw error;
         }
     }
 
@@ -979,11 +991,13 @@ class MCUManager {
         if (this._uploadTimeout) {
             clearTimeout(this._uploadTimeout);
         }
+
         // Set new timeout
+        const chunkTimeout = this._uploadOffset === 0 ? this._firstChunkTimeout : this._chunkTimeout;
         this._uploadTimeout = setTimeout(() => {
             this._logger.info('Upload chunk timeout, retry');
             this._uploadNext();
-        }, this._chunkTimeout);
+        }, chunkTimeout);
 
         const nmpOverhead = 8;
         const message = { data: new Uint8Array(), off: this._uploadOffset, image: this._uploadImageNumber };
@@ -1105,11 +1119,13 @@ class MCUManager {
         if (this._uploadTimeout) {
             clearTimeout(this._uploadTimeout);
         }
-        // Set new timeout
+        
+        // Set new timeout - use first chunk timeout for first chunk, otherwise use regular timeout
+        const chunkTimeout = this._uploadOffset === 0 ? this._firstChunkTimeout : this._chunkTimeout;
         this._uploadTimeout = setTimeout(() => {
             this._logger.info('Upload chunk timeout, retry');
             this._uploadNextFileSystem();
-        }, this._chunkTimeout);
+        }, chunkTimeout);
 
         const nmpOverhead = 20;
         const message = { data: new Uint8Array(), off: this._uploadOffset, name: this._uploadName };
